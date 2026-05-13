@@ -179,8 +179,8 @@ def train_once(args, seed):
         device=device,
     )
 
-    # 5) 构建双分支模型：冻结分支保留先验，适应分支学习目标域
-    print("🏗️ 构建双分支跨域图提示框架...")
+    # 5) 构建双分支模型：冻结分支保留先验，适应分支(Adapter)学习目标域
+    print(f"🏗️ 构建双分支跨域图提示框架 (使用 Layer-wise Adapter, r={args.adapter_r})...")
     model = DualBranchCrossDomainGNN(
         pretrained_gnn=pretrained_backbone,
         hidden_channels=args.hidden_dim,
@@ -188,10 +188,14 @@ def train_once(args, seed):
         prompt_homo_dim=target_in_dim,
         prompt_hete_dim=target_in_dim * 2,
         tau=args.tau,
+        adapter_r=args.adapter_r # <--- 传入新增的 Adapter 瓶颈维度
     ).to(device)
 
-    # 6) 优化参数 = 模型可训练参数 + 对齐层参数
+    # 6) 【魔法发生的地方】：由于我们重写了模型逻辑，庞大的 GNN 参数在这里被自动过滤了！
+    # 优化器只会捕捉到：aligner, 极小的 GP2FAdapter, w_adapter_homo/hete, 门控机制和分类器
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(aligner.parameters())
+    print(f"📉 可训练参数规模暴降！目前参与优化的参数张量总数: {len(trainable_params)}")
+    
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
     # 7) 训练主循环（按 val_acc 早停）
@@ -216,9 +220,10 @@ def train_once(args, seed):
         # 三个主损失：
         # - loss_cls: few-shot 监督分类
         # - loss_sparse: 路由熵约束（鼓励更稀疏选择）
-        # - loss_consist: 适应分支与冻结分支的一致性约束
+        # - loss_consist: 适应分支与冻结分支的一致性约束 (现在作用于经过 Adapter 微调后的特征)
         loss_cls = F.cross_entropy(logits[train_mask], labels[train_mask])
         loss_sparse = -torch.mean(torch.sum(ex_total * torch.log(ex_total + 1e-8), dim=-1))
+        
         if args.consist_on_train_only:
             consist_mask = train_mask
             if consist_mask.sum().item() > 0:
@@ -251,6 +256,7 @@ def train_once(args, seed):
         )
         loss.backward()
         optimizer.step()
+        
         # Gumbel 温度退火：逐步从“软选择”变“更尖锐选择”
         model.global_router.tau = max(args.min_tau, model.global_router.tau * args.tau_decay)
 
@@ -291,7 +297,7 @@ def train_once(args, seed):
                 print(f"⏹️ Early stopping at epoch {epoch} (patience={args.patience})")
                 break
 
-    # 恢复最佳验证点对应的模型参数（避免最后一轮退化）
+    # 恢复最佳验证点对应的模型参数
     if best_state is not None:
         model.load_state_dict(best_state["model"])
         aligner.load_state_dict(best_state["aligner"])
@@ -316,6 +322,9 @@ def parse_args():
     parser.add_argument('--source_dim', type=int, default=500, help='源域特征维度(PubMed=500, Cora=1433)')
     parser.add_argument('--hidden_dim', type=int, default=128, help='预训练模型隐藏层维度')
 
+    # 新增的 GP2F 适配器瓶颈维度参数
+    parser.add_argument('--adapter_r', type=int, default=32, help='GP2F Adapter 降维空间的秩 (默认: 32)')
+
     parser.add_argument('--shots', type=int, default=5, help='每类 few-shot 数量')
     parser.add_argument('--val_node_num', type=int, default=1000, help='验证集节点数')
     parser.add_argument('--test_node_num', type=int, default=1000, help='测试集节点数')
@@ -323,7 +332,7 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=300, help='训练轮数')
     parser.add_argument('--weight_decay', type=float, default=5e-3, help='权重衰减')
     parser.add_argument('--eval_every', type=int, default=10, help='评估间隔 epoch')
-    parser.add_argument('--patience', type=int, default=8, help='early stop 容忍评估次数')
+    parser.add_argument('--patience', type=int, default=10, help='early stop 容忍评估次数')
     parser.add_argument('--seeds', type=str, default='42', help='随机种子列表，如 42,52,62')
 
     parser.add_argument('--k_homo', type=int, default=10, help='同配提示节点数')
@@ -371,7 +380,6 @@ def main():
     - 汇总 mean/std，得到更稳健的结论
     """
     args = parse_args()
-    # 单次训练：始终用 --seeds。网格搜索：默认用 --grid_seeds（少 seed 省时间），可用 --grid_use_full_seeds 覆盖。
     if args.grid_search:
         if args.grid_use_full_seeds:
             active_seeds = _parse_seed_list(args.seeds)
@@ -426,7 +434,7 @@ def main():
     combo_iter = list(itertools.product(sparse_list, consist_list, tau_decay_list, min_tau_list))
     print("\n" + "=" * 54)
     print(f"🔎 网格搜索启动，共 {len(combo_iter)} 组配置")
-    print(f"   本阶段使用 seeds: {active_seeds}（网格默认少 seed；需要与单次一致请加 --grid_use_full_seeds）")
+    print(f"   本阶段使用 seeds: {active_seeds}")
     print("=" * 54)
 
     for idx, (lam_sparse, lam_consist, tau_decay, min_tau) in enumerate(combo_iter, start=1):
@@ -450,10 +458,6 @@ def main():
             **summary,
         }
         all_results.append(result)
-        print(
-            f"-> Test(mean±std): {summary['test_mean']*100:.2f}% ± {summary['test_std']*100:.2f}% | "
-            f"Val(mean): {summary['val_mean']*100:.2f}% | PromptEdgeH: {summary['prompt_edge_h_mean']:.4f}"
-        )
 
     best = max(all_results, key=lambda r: (r["test_mean"], r["val_mean"]))
     print("\n" + "=" * 54)
@@ -466,10 +470,6 @@ def main():
     print(
         f"BestTest@BestVal(mean±std): {best['test_mean']*100:.2f}% ± {best['test_std']*100:.2f}% | "
         f"BestVal(mean): {best['val_mean']*100:.2f}%"
-    )
-    print(
-        f"EdgeH: {best['edge_h_mean']:.4f} | PromptEdgeH: {best['prompt_edge_h_mean']:.4f} | "
-        f"PromptPurity: {best['prompt_purity_mean']:.4f}"
     )
 
 
