@@ -4,8 +4,8 @@ Motivation:
 
 本文的idea如下：
 提示初始化：
-将目标图输入GNN,得到低频信号H_homo对表征进行k-means聚类得到K1个同配提示节点P_homo;
-计算图的高频信号H_hete,拼接低频和高频信号得到H_aug,对H_aug进行聚类得到K2个异配提示节点P_hete;
+将目标图输入冻结GNN,得到低频信号H_homo对表征进行k-means聚类得到K1个同配提示节点P_homo;
+计算图的高频信号H_hete（残差）,拼接低频和高频信号得到H_aug,对H_aug进行聚类得到K2个异配提示节点P_hete;
 
 GumbelSoftmax连边:
 计算原图节点和提示节点之间的连接意愿分数Logits,进行Gumbel-softmax转换生成EX_homo和EX_hete矩阵;
@@ -19,12 +19,14 @@ GumbelSoftmax连边:
 
 
 实验一：PubMed->Amazon-rating
-运行：
-# 网格：每组只跑 seed 42（最快）
-python train.py --grid_search ... 
+a. prompts❌ dual-branch❌
+python train_baseline.py --source_dataset PubMed --target_dataset Amazon-ratings
+b. prompts❌ dual-branch✅
+python train_adapter_only.py --source_dataset PubMed --target_dataset Amazon-ratings --adapter_r 32
+c. prompts✅ dual-branch✅
 
-# 网格：每组跑 42 和 0（仍比三个 seed 省）
-python train.py --grid_search ... --grid_seeds 42,0
-
-# 选好超参后，网格也用完整 seeds 做最终确认（最慢、最稳）
-python train.py --grid_search ... --seeds 42,52,62 --grid_use_full_seeds
+提交：
+git status
+git add .
+git commit -m "feat: 完成了特征提示+双分支的初步实现"
+git push origin main
