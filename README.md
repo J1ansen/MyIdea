@@ -21,9 +21,14 @@ GumbelSoftmax连边:
 实验一：PubMed->Amazon-rating
 a. prompts❌ dual-branch❌
 python train_baseline.py --source_dataset PubMed --target_dataset Amazon-ratings
+python train_baseline.py --source_dataset PubMed --target_dataset Cora
 b. prompts❌ dual-branch✅
 python train_adapter_only.py --source_dataset PubMed --target_dataset Amazon-ratings --adapter_r 32
-c. prompts✅ dual-branch✅
+c. prompts✅ dual-branch❌
+python test_prompt_module.py --target_dataset Amazon-ratings --k_homo 10 --k_hete 10
+python test_prompt_module.py --target_dataset Cora --source_dataset PubMed --source_dim 500 --k_homo 14 --k_hete 14 --lr 0.01 --epochs 200
+d. prompts✅ dual-branch✅
+python train.py --source_dataset PubMed --target_dataset Amazon-ratings --adapter_r 32 --shots 5 --lr 0.001
 
 提交：
 git status

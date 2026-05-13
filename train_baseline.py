@@ -1,3 +1,4 @@
+#测试baseline模块：无提示无Adapter
 # train_baseline.py (项目根目录)
 import os
 import copy

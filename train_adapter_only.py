@@ -1,3 +1,4 @@
+#测试双分支模块
 # train_adapter_only.py (项目根目录)
 import os
 import copy
@@ -110,7 +111,13 @@ def train_once(args, seed):
     )
 
     # 2. 维度对齐层 (Aligner)
-    aligner = nn.Linear(target_in_dim, args.source_dim).to(device)
+    # 2. 维度对齐层 (Aligner) - 换成低秩投影以防止 15万 参数的过拟合！
+    aligner_r = 64 # 引入一个瓶颈维度
+    aligner = nn.Sequential(
+        nn.Linear(target_in_dim, aligner_r),
+        nn.ReLU(),
+        nn.Linear(aligner_r, args.source_dim)
+    ).to(device)
 
     # 3. 加载预训练模型
     weight_file = f"./pretrained_gnns/{args.source_dataset}_SimGRACE_GCN_1.pth"
