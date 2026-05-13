@@ -16,3 +16,15 @@ GumbelSoftmax连边:
 
 适应分支设计:
 设计一个低参数的权重矩阵W_adapter,原图节点会沿着EX拼接矩阵(EX_homo和EX_hete)的提示边有选择性地聚合来自提示节点的特征信号,生成目标域独有的提示信息流M_prompt(N+K维),再采用一个门控向量,缩放提示信息,自适应融合原图信息M_real和提示信息M_prompt最终生成H_adapted。
+
+
+实验一：PubMed->Amazon-rating
+运行：
+# 网格：每组只跑 seed 42（最快）
+python train.py --grid_search ... 
+
+# 网格：每组跑 42 和 0（仍比三个 seed 省）
+python train.py --grid_search ... --grid_seeds 42,0
+
+# 选好超参后，网格也用完整 seeds 做最终确认（最慢、最稳）
+python train.py --grid_search ... --seeds 42,52,62 --grid_use_full_seeds

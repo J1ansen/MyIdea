@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.venv/
+venv/
+
+# 实验数据（体积大，勿提交）
+data/
+
+# 预训练权重：默认只跟踪 train.py 使用的 PubMed SimGRACE（其余保留在本地）
+pretrained_gnns/*.pth
+!pretrained_gnns/PubMed_SimGRACE_GCN_1.pth
+
+# IDE / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
