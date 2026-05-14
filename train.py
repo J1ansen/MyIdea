@@ -21,7 +21,6 @@ from prompts.cluster_generator import PromptGenerator
 from models.base_gnn import load_pretrained_backbone
 from load_data import load_node_data
 
-
 def set_seed(seed):
     """固定随机性，保证多次实验可复现。"""
     random.seed(seed)

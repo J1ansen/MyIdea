@@ -8,7 +8,7 @@ class GlobalGumbelRouter(nn.Module):
     零参数的全局互斥 Gumbel-Softmax 路由器
     """
     def __init__(self, tau=1.0):
-        # 删除了所有 proj 线性层，彻底斩断过拟合！
+        # 删除了所有 proj 线性层，应对过拟合
         super(GlobalGumbelRouter, self).__init__()
         self.tau = tau
 

@@ -17,18 +17,20 @@ GumbelSoftmax连边:
 适应分支设计:
 设计一个低参数的权重矩阵W_adapter,原图节点会沿着EX拼接矩阵(EX_homo和EX_hete)的提示边有选择性地聚合来自提示节点的特征信号,生成目标域独有的提示信息流M_prompt(N+K维),再采用一个门控向量,缩放提示信息,自适应融合原图信息M_real和提示信息M_prompt最终生成H_adapted。
 
-
+实验Experiments
 实验一：PubMed->Amazon-rating
 a. prompts❌ dual-branch❌
 python train_baseline.py --source_dataset PubMed --target_dataset Amazon-ratings
-python train_baseline.py --source_dataset PubMed --target_dataset Cora
 b. prompts❌ dual-branch✅
 python train_adapter_only.py --source_dataset PubMed --target_dataset Amazon-ratings --adapter_r 32
 c. prompts✅ dual-branch❌
 python test_prompt_module.py --target_dataset Amazon-ratings --k_homo 10 --k_hete 10
-python test_prompt_module.py --target_dataset Cora --source_dataset PubMed --source_dim 500 --k_homo 14 --k_hete 14 --lr 0.01 --epochs 200
 d. prompts✅ dual-branch✅
 python train.py --source_dataset PubMed --target_dataset Amazon-ratings --adapter_r 32 --shots 5 --lr 0.001
+
+实验二：PubMed->Cora
+python train_baseline.py --source_dataset PubMed --target_dataset Cora
+python test_prompt_module.py --target_dataset Cora --source_dataset PubMed --source_dim 500 --k_homo 14 --k_hete 14 --lr 0.01 --epochs 200
 
 提交：
 git status
