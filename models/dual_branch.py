@@ -1,98 +1,79 @@
-# models/dual_branch.py
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import copy
-
 from prompts.global_router import GlobalGumbelRouter
-from models.gp2f_adapter import GP2FAdapter  # 引入刚才写的 Adapter
 
 class DualBranchCrossDomainGNN(nn.Module):
-    def __init__(self, pretrained_gnn, hidden_channels, out_channels, prompt_homo_dim, prompt_hete_dim, tau=1.0, adapter_r=32):
-        super(DualBranchCrossDomainGNN, self).__init__()
+    def __init__(self, pretrained_gnn, hidden_channels, out_channels, prompt_homo_dim, prompt_hete_dim, tau=1.0, adapter_r=8):
+        super().__init__()
+        self.hidden_dim = hidden_channels
         
-        # ==========================================
-        # 1. 冻结分支 (Frozen Branch) - 彻底锁死
-        # ==========================================
-        self.frozen_branch = copy.deepcopy(pretrained_gnn)
+        # 1. 冻结分支 (老专家，保留源域知识)
+        self.frozen_branch = pretrained_gnn
         for param in self.frozen_branch.parameters():
             param.requires_grad = False
             
-        # ==========================================
-        # 2. 适应分支 (Adapted Branch) - 替换为轻量级逐层 Adapter
-        # ==========================================
-        # 针对 2 层 GCN，我们在每一层后接入一个 Adapter (维度与隐藏层对齐)
-        self.adapter_layer1 = GP2FAdapter(feature_dim=hidden_channels, r=adapter_r)
-        self.adapter_layer2 = GP2FAdapter(feature_dim=hidden_channels, r=adapter_r)
+        # 2. 适应分支 (学习目标域知识)
+        # 这里使用深拷贝预训练模型作为适应分支基础。如果你有专用的 GP2FAdapter，也可以在这替换。
+        self.adapted_branch = copy.deepcopy(pretrained_gnn)
+        for param in self.adapted_branch.parameters():
+            param.requires_grad = True
+            
+        # 3. 初始化残差稀疏路由器
+        # 注意：由于提示节点是在隐层空间 (128维) 聚类出来的，这里的特征维度使用隐层维度
+        self.global_router = GlobalGumbelRouter(feature_dim=prompt_homo_dim, tau=tau)
         
-        # ==========================================
-        # 3. 零参数全局路由器 (Zero-param Global Router)
-        # ==========================================
-        self.global_router = GlobalGumbelRouter(tau=tau)
-        
-        # ==========================================
-        # 4. 提示节点维度适应器 (Aligners)
-        # ==========================================
-        self.w_adapter_homo = nn.Linear(prompt_homo_dim, hidden_channels)
-        self.w_adapter_hete = nn.Linear(prompt_hete_dim, hidden_channels)
-        
-        # ==========================================
-        # 5. 门控融合与分类器 (Gating & Classifier)
-        # ==========================================
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_channels * 2, hidden_channels // 2),
-            nn.GELU(),
-            nn.Linear(hidden_channels // 2, 1),
+        # 4. 特征自适应门控融合层
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, 1),
             nn.Sigmoid()
         )
-        self.classifier = nn.Linear(hidden_channels * 2, out_channels)
+        
+        # 5. 最终分类器
+        self.classifier = nn.Linear(self.hidden_dim, out_channels)
+        
+        # 动态投影层 (用于将 128 维的 prompt 投回 500 维的原图特征空间)
+        self.prompt_up_proj = None
 
-    def train(self, mode=True):
-        """物理防范 Dropout 陷阱，确保老专家彻底被锁死在评估模式"""
-        super().train(mode)
-        self.frozen_branch.eval()
-        return self
-
-    def forward(self, x, edge_index, p_homo, p_hete, hard_route=False):
-        # -------------------------------------------
-        # 步骤 A：双分支特征提取 (GP2F 逐层推演逻辑)
-        # -------------------------------------------
-        # 【分支 1：冻结分支】 直接利用老专家提取纯净的源域先验
+    def forward(self, x_aligned, edge_index, p_homo, p_hete, hard_route=False):
+        # 1. 冻结分支前向传播，得到先验表征 [N, 128]
         with torch.no_grad():
-            h_frozen = self.frozen_branch(x, edge_index)
-            
-        # 【分支 2：适应分支】 借用老专家权重，逐层注入目标域偏差
-        # 第一层：卷积 -> Adapter微调 -> 激活 -> Dropout
-        h1 = self.frozen_branch.conv1(x, edge_index)
-        h1_adapted = self.adapter_layer1(h1)
-        h1_adapted = F.relu(h1_adapted)
-        h1_adapted = F.dropout(h1_adapted, p=0.5, training=self.training)
+            self.frozen_branch.eval()
+            h_frozen = self.frozen_branch(x_aligned, edge_index)
         
-        # 第二层：卷积 -> Adapter微调 (得到目标域专属表征 m_real)
-        h2 = self.frozen_branch.conv2(h1_adapted, edge_index)
-        m_real = self.adapter_layer2(h2)
+        # 统一提示特征维度 (因为 p_hete 可能是拼接了残差的 256 维，需对齐回 128 维)
+        if p_hete.shape[-1] != p_homo.shape[-1]:
+            p_hete_aligned = p_hete[:, :p_homo.shape[-1]]
+        else:
+            p_hete_aligned = p_hete
         
-        # -------------------------------------------
-        # 步骤 B：提示对齐与零参数全局路由 (解决结构异配)
-        # -------------------------------------------
-        # 1. 先对齐提示节点到统一维度
-        p_homo_aligned = self.w_adapter_homo(p_homo)
-        p_hete_aligned = self.w_adapter_hete(p_hete)
+        # 2. 获取全局路由与门控权重
+        ex_optimized, gate_weight, ex_base, p_total = self.global_router(
+            x_aligned, h_frozen, p_homo, p_hete_aligned, hard=hard_route
+        )
         
-        # 2. 算纯净点积并进行联合全局路由
-        ex_homo, ex_hete, ex_total = self.global_router(m_real, p_homo_aligned, p_hete_aligned, hard=hard_route)
+        # 3. 【核心拓扑增强】通过路由矩阵拉取提示空间的同类特征 [N, 128]
+        m_prompt = torch.matmul(ex_optimized, p_total) 
         
-        # 3. 吸收提示特征
-        m_prompt = torch.matmul(ex_homo, p_homo_aligned) + torch.matmul(ex_hete, p_hete_aligned)
+        # 4. 【早期特征融合】在图卷积之前增强节点输入特征
+        # 因为 x_aligned 是 500 维，m_prompt 是 128 维，自动初始化投影层对齐
+        if self.prompt_up_proj is None or self.prompt_up_proj.in_features != m_prompt.shape[-1]:
+            self.prompt_up_proj = nn.Linear(m_prompt.shape[-1], x_aligned.shape[-1], bias=False).to(x_aligned.device)
         
-        # -------------------------------------------
-        # 步骤 C & D：门控融合与双分支对齐输出
-        # -------------------------------------------
-        gate_input = torch.cat([m_real, m_prompt], dim=-1)
-        g = self.gate(gate_input)
-        h_adapted_final = g * m_real + (1 - g) * m_prompt
+        m_prompt_projected = self.prompt_up_proj(m_prompt)
+        x_enhanced = x_aligned + m_prompt_projected 
         
-        final_rep = torch.cat([h_frozen, h_adapted_final], dim=-1)
-        logits = self.classifier(final_rep)
+        # 5. 适应分支前向传播 (在增强后的同配特征上进行 Message Passing)
+        h_adapted = self.adapted_branch(x_enhanced, edge_index)
         
-        return logits, h_frozen, h_adapted_final, ex_total
+        # 6. 后期双分支门控融合
+        combined_features = torch.cat([h_frozen, h_adapted], dim=-1)
+        beta = self.fusion_gate(combined_features)
+        h_final = beta * h_adapted + (1 - beta) * h_frozen
+        
+        # 7. 分类器输出
+        logits = self.classifier(h_final)
+        
+        return logits, h_final, h_frozen, h_adapted, gate_weight, ex_optimized

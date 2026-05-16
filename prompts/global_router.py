@@ -1,33 +1,43 @@
-# prompts/global_router.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 class GlobalGumbelRouter(nn.Module):
-    """
-    零参数的全局互斥 Gumbel-Softmax 路由器
-    """
-    def __init__(self, tau=1.0):
-        # 删除了所有 proj 线性层，应对过拟合
-        super(GlobalGumbelRouter, self).__init__()
+    def __init__(self, feature_dim, tau=1.0):
+        super().__init__()
         self.tau = tau
+        
+        # 残差门控网络
+        self.residual_gate = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim // 2),
+            nn.ReLU(),
+            nn.Linear(feature_dim // 2, 1),
+            nn.Sigmoid() 
+        )
 
-    def forward(self, m_real, p_homo_aligned, p_hete_aligned, hard=False):
-        """
-        注意：传入的提示节点特征必须是已经经过 w_adapter 对齐维度的！
-        """
-        K1 = p_homo_aligned.size(0)
+    def forward(self, x_aligned, h_frozen, p_homo, p_hete, hard=False):
+        # 1. 拼接所有提示节点 [K, 128]
+        p_total = torch.cat([p_homo, p_hete], dim=0) 
         
-        # 直接计算点积相似度 (两个空间维度已经一致，无需学习参数)
-        logits_homo = torch.matmul(m_real, p_homo_aligned.t())  # [N, K1]
-        logits_hete = torch.matmul(m_real, p_hete_aligned.t())  # [N, K2]
+        # 2. 计算点积相似度 Logits
+        # 【极其关键的修复】：使用 h_frozen (128维) 和 p_total (128维) 进行点积
+        # 因为提示节点本身就是在 h_frozen 的低频空间聚类出来的，在这个空间算距离最纯粹
+        logits_total = torch.matmul(h_frozen, p_total.t()) 
+
+        # 3. Gumbel-Softmax 基础路由
+        ex_base = F.gumbel_softmax(logits_total, tau=self.tau, hard=hard, dim=-1)
+
+        # 4. 计算高频残差 (异配病灶)
+        # 截断对齐 x_aligned 以便与 h_frozen 做减法
+        if x_aligned.shape[-1] != h_frozen.shape[-1]:
+            residual = x_aligned[:, :h_frozen.shape[-1]] - h_frozen
+        else:
+            residual = x_aligned - h_frozen
         
-        # 拼接并计算全局唯一的 Softmax
-        logits_total = torch.cat([logits_homo, logits_hete], dim=-1)
-        ex_total = F.gumbel_softmax(logits_total, tau=self.tau, hard=hard, dim=-1)
-        
-        # 拆分返回，以便分别乘以同配和异配的提示特征
-        ex_homo = ex_total[:, :K1]
-        ex_hete = ex_total[:, K1:]
-        
-        return ex_homo, ex_hete, ex_total
+        # 5. 生成稀疏门控掩码 g
+        g = self.residual_gate(residual)
+
+        # 6. 自适应稀疏截断
+        ex_optimized = ex_base * g 
+
+        return ex_optimized, g, ex_base, p_total

@@ -90,10 +90,12 @@ def analyze_prompt_homophily(model, aligner, data, p_homo, p_hete, args):
     aligner.eval()
     with torch.no_grad():
         x_eval = aligner(data.x)
-        _, _, _, ex_total = model(
+        # 【修改点 1】：适配新的双分支返回值解包
+        logits_eval, h_final, h_frozen, h_adapted, gate_weight, ex_optimized = model(
             x_eval, data.edge_index, p_homo, p_hete, hard_route=args.eval_hard_route
         )
-        prompt_assignments = ex_total.argmax(dim=1)
+        # 此时应该通过门控优化后的路由矩阵来判断连边
+        prompt_assignments = ex_optimized.argmax(dim=1)
         true_labels = data.y.squeeze()
 
         total_prompt_nodes = args.k_homo + args.k_hete
@@ -142,7 +144,6 @@ def train_once(args, seed):
     )
 
     # 2) 初始化维度对齐层 (Aligner)
-    # 使用 Sequential 结构，稍微增加复杂度以更好对齐源域特征空间
     aligner = nn.Sequential(
         nn.Linear(target_in_dim, args.source_dim),
         nn.ReLU(),
@@ -158,10 +159,9 @@ def train_once(args, seed):
         device=device,
     )
 
-    # 4) 【核心修改】：使用真实的 GNN 提取表征并生成静态提示
+    # 4) 生成静态提示
     print(f"\n🔮 正在基于预训练 GNN 提取 {args.target_dataset} 的同配/异配神经锚点...")
     generator = PromptGenerator(k_homo=args.k_homo, k_hete=args.k_hete, device=device)
-    # 按照你的 idea：传入模型和对齐层来计算残差并聚类
     p_homo, p_hete = generator.generate(data, pretrained_backbone, aligner)
 
     # 5) 构建双分支模型
@@ -169,12 +169,14 @@ def train_once(args, seed):
         pretrained_gnn=pretrained_backbone,
         hidden_channels=args.hidden_dim,
         out_channels=target_out_dim,
-        # 维度由 generator 决定：homo 是 hidden_dim, hete 是 2 * hidden_dim
         prompt_homo_dim=p_homo.size(-1),
         prompt_hete_dim=p_hete.size(-1),
         tau=args.tau,
         adapter_r=args.adapter_r
     ).to(device)
+
+    # 初始化路由器的温度
+    model.global_router.tau = args.tau
 
     # 6) 优化器
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(aligner.parameters())
@@ -193,27 +195,33 @@ def train_once(args, seed):
         optimizer.zero_grad()
 
         x_aligned = aligner(data.x)
-        # 前向传播得到：预测值，冻结表征，纯净的适应表征(m_real)，路由矩阵
-        logits, h_frozen, m_real, ex_total = model(
+        
+        # 【修改点 2】：解包最新的返回值，获取残差门控权重 gate_weight
+        logits, h_final, h_frozen, h_adapted, gate_weight, ex_optimized = model(
             x_aligned, data.edge_index, p_homo, p_hete, hard_route=args.train_hard_route
         )
 
         loss_cls = F.cross_entropy(logits[train_mask], labels[train_mask])
-        loss_sparse = -torch.mean(torch.sum(ex_total * torch.log(ex_total + 1e-8), dim=-1))
         
-        # 【修复】：一致性损失只约束 Adapter 出来的 m_real，不干涉 Prompt 的纠偏功能
+        # 【修改点 3】：稀疏损失作用于经过门控截断后的 ex_optimized，只约束活跃的节点
+        loss_sparse = -torch.mean(torch.sum(ex_optimized * torch.log(ex_optimized + 1e-8), dim=-1))
+        
+        # 【修改点 4】：极其关键的选择性一致性损失 (Selective Consistency)
+        # 计算逐节点差异
+        mse_diff = F.mse_loss(h_adapted, h_frozen, reduction='none').mean(dim=-1, keepdim=True)
         if args.consist_on_train_only:
-            loss_consist = F.mse_loss(m_real[train_mask], h_frozen[train_mask])
+            # 对于同配好节点(gate_weight小)，施加强约束；对于异配坏节点(gate_weight大)，释放约束
+            loss_consist = torch.mean((1 - gate_weight[train_mask]) * mse_diff[train_mask])
         else:
-            loss_consist = F.mse_loss(m_real, h_frozen)
+            loss_consist = torch.mean((1 - gate_weight) * mse_diff)
 
-        # 路由分布一致性
+        # 路由分布一致性（同样替换为 ex_optimized）
         route_consist_terms = []
         train_labels = labels[train_mask]
         for cls in train_labels.unique():
             cls_mask = train_mask & (labels == cls)
             if cls_mask.sum().item() > 1:
-                ex_cls = ex_total[cls_mask]
+                ex_cls = ex_optimized[cls_mask]
                 cls_center = ex_cls.mean(dim=0, keepdim=True)
                 route_consist_terms.append(F.mse_loss(ex_cls, cls_center.expand_as(ex_cls)))
         loss_route_consist = torch.stack(route_consist_terms).mean() if route_consist_terms else torch.tensor(0.0, device=device)
@@ -228,7 +236,7 @@ def train_once(args, seed):
         loss.backward()
         optimizer.step()
         
-        # 路由器温度退火
+        # 【修改点 5】：动态进行 Gumbel-Softmax 的温度退火
         model.global_router.tau = max(args.min_tau, model.global_router.tau * args.tau_decay)
 
         if epoch % args.eval_every == 0 or epoch == 1:
@@ -236,7 +244,8 @@ def train_once(args, seed):
             aligner.eval()
             with torch.no_grad():
                 x_eval = aligner(data.x)
-                logits_eval, _, _, _ = model(
+                # 评估时也适配新的返回值
+                logits_eval, _, _, _, avg_gate_eval, _ = model(
                     x_eval, data.edge_index, p_homo, p_hete, hard_route=args.eval_hard_route
                 )
                 train_acc = compute_acc(logits_eval, labels, train_mask)
@@ -258,6 +267,7 @@ def train_once(args, seed):
                 f"Epoch {epoch:03d} | Loss: {loss.item():.4f} "
                 f"(Cls: {loss_cls.item():.4f}, Sparse: {loss_sparse.item():.4f}, "
                 f"Consist: {loss_consist.item():.4f}) "
+                f"| Tau: {model.global_router.tau:.4f} | Gate Avg: {avg_gate_eval.mean().item():.4f} "
                 f"| Train/Val/Test: {train_acc*100:.2f}/{val_acc*100:.2f}/{test_acc*100:.2f} "
                 f"| BestVal: {best_val_acc*100:.2f} | BestTest@BestVal: {best_test_acc*100:.2f}"
             )
