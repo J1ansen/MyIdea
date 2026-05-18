@@ -1,333 +1,342 @@
-# train.py (项目根目录)
-import os
-import copy
-import random
+from __future__ import annotations
+
 import argparse
-import itertools
+import os
+import random
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_geometric.transforms as T
+from torch_geometric.datasets import Actor, Planetoid, WebKB, WikipediaNetwork
 
-# 导入图同配性计算工具
-from torch_geometric.utils import homophily
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-# ==========================================
-# 导入自定义模块
-# ==========================================
-from models.dual_branch import DualBranchCrossDomainGNN
-from prompts.cluster_generator import PromptGenerator
+from loss import consistency_loss, prompt_edge_contrastive_loss
 from models.base_gnn import load_pretrained_backbone
-from load_data import load_node_data
+from models.dual_branch import DualBranchGNN
+from prompts.cluster_generator import PromptGenerator
+from prompts.gumbel_route import GumbelRouter
 
-def set_seed(seed):
-    """固定随机性，保证多次实验可复现。"""
+
+@dataclass
+class Split:
+    train_mask: torch.Tensor
+    val_mask: torch.Tensor
+    test_mask: torch.Tensor
+
+
+class InputAligner(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(in_dim, out_dim, bias=False)
+        nn.init.orthogonal_(self.proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+class PromptFeatureAligner(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(in_dim, out_dim, bias=False)
+        nn.init.orthogonal_(self.proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+class PromptLossWeights:
+    def __init__(self, lambda1: float, lambda2: float, lambda3: float) -> None:
+        self.lambda1 = lambda1
+        self.lambda2 = lambda2
+        self.lambda3 = lambda3
+
+
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def build_masks(data, shots, val_node_num, test_node_num, seed, device):
-    """
-    构建 train/val/test 掩码：
-    - train: 每类采样 shots 个节点（few-shot）
-    - val/test: 从剩余节点中随机划分
-    """
-    rng = random.Random(seed)
-    y = data.y.squeeze()
+def load_dataset(name: str, root: str):
+    transform = T.NormalizeFeatures()
+    if name in {"Cora", "CiteSeer", "PubMed"}:
+        return Planetoid(root=root, name=name, transform=transform)
+    if name in {"Chameleon", "Squirrel"}:
+        return WikipediaNetwork(root=root, name=name, transform=transform)
+    if name == "Cornell":
+        return WebKB(root=root, name=name, transform=transform)
+    if name == "Actor":
+        return Actor(root=root, transform=transform)
+    return WikipediaNetwork(root=root, name=name, transform=transform)
+
+
+def build_few_shot_masks(y: torch.Tensor, shots: int, seed: int) -> Split:
+    rng = np.random.default_rng(seed)
     num_classes = int(y.max().item() + 1)
-    train_nodes = []
+    train_mask = torch.zeros(y.size(0), dtype=torch.bool, device=y.device)
+    val_mask = torch.zeros_like(train_mask)
+    test_mask = torch.zeros_like(train_mask)
 
-    for cls in range(num_classes):
-        cls_indices = torch.where(y == cls)[0].tolist()
-        if len(cls_indices) <= shots:
-            train_nodes.extend(cls_indices)
-        else:
-            train_nodes.extend(rng.sample(cls_indices, k=shots))
+    for c in range(num_classes):
+        idx = torch.where(y == c)[0].cpu().tolist()
+        rng.shuffle(idx)
+        train_idx = idx[:shots]
+        val_idx = idx[shots : shots + 30]
+        test_idx = idx[shots + 30 :]
+        train_mask[train_idx] = True
+        val_mask[val_idx] = True
+        test_mask[test_idx] = True
 
-    remain_nodes = [idx for idx in range(data.num_nodes) if idx not in set(train_nodes)]
-    rng.shuffle(remain_nodes)
-
-    val_nodes = remain_nodes[:val_node_num]
-    test_nodes = remain_nodes[val_node_num:val_node_num + test_node_num]
-
-    train_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=device)
-    val_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=device)
-    test_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=device)
-    train_mask[train_nodes] = True
-    val_mask[val_nodes] = True
-    test_mask[test_nodes] = True
-    return train_mask, val_mask, test_mask
+    return Split(train_mask, val_mask, test_mask)
 
 
-def compute_acc(logits, labels, mask):
-    """在指定 mask 上计算准确率。"""
-    if mask.sum().item() == 0:
+def infer_edge_homophily(data) -> float:
+    if data.y is None or data.edge_index is None:
         return 0.0
-    preds = logits.argmax(dim=1)
-    correct = (preds[mask] == labels[mask]).sum().item()
-    return correct / mask.sum().item()
+    src, dst = data.edge_index
+    valid = (src >= 0) & (dst >= 0) & (src < data.y.numel()) & (dst < data.y.numel())
+    src, dst = src[valid], dst[valid]
+    if src.numel() == 0:
+        return 0.0
+    return float((data.y[src] == data.y[dst]).float().mean().item())
 
 
-def get_consistency_weight(epoch, args):
-    """一致性损失权重调度"""
-    base = args.lambda_consist
-    warmup = args.consist_warmup_epochs
-    min_ratio = args.consist_min_ratio
-    if warmup <= 0 or epoch <= warmup:
-        return base
-    tail_epochs = max(1, args.epochs - warmup)
-    decay_progress = min(1.0, (epoch - warmup) / tail_epochs)
-    current_ratio = 1.0 - decay_progress * (1.0 - min_ratio)
-    return base * current_ratio
+def infer_checkpoint_dims(weight_path: str, device: torch.device) -> Tuple[int, int]:
+    checkpoint = torch.load(weight_path, map_location=device)
+    if isinstance(checkpoint, dict):
+        state_dict = checkpoint.get("state_dict", checkpoint.get("model_state_dict", checkpoint))
+    elif isinstance(checkpoint, nn.Module):
+        state_dict = checkpoint.state_dict()
+    else:
+        state_dict = checkpoint
+
+    for key, tensor in state_dict.items():
+        if key.endswith("conv1.lin.weight") and tensor.ndim == 2:
+            return int(tensor.shape[1]), int(tensor.shape[0])
+        if key.endswith("conv1.weight") and tensor.ndim == 2:
+            return int(tensor.shape[1]), int(tensor.shape[0])
+        if key.endswith("lin1.weight") and tensor.ndim == 2:
+            return int(tensor.shape[1]), int(tensor.shape[0])
+    raise ValueError(f"Cannot infer dimensions from checkpoint: {weight_path}")
 
 
-def analyze_prompt_homophily(model, aligner, data, p_homo, p_hete, args):
-    """训练后分析提示模块质量"""
+def normalize_prompt_dim(prompt: torch.Tensor, target_dim: int) -> torch.Tensor:
+    if prompt.size(-1) == target_dim:
+        return prompt
+    if prompt.size(-1) > target_dim:
+        return prompt[:, :target_dim]
+    pad = torch.zeros(prompt.size(0), target_dim - prompt.size(-1), device=prompt.device, dtype=prompt.dtype)
+    return torch.cat([prompt, pad], dim=-1)
+
+
+def build_prompt_edges(
+    ex_weights: torch.Tensor,
+    num_nodes: int,
+    topk_prompts: int,
+    device: torch.device,
+) -> torch.Tensor:
+    topk_prompts = max(1, min(topk_prompts, ex_weights.size(-1)))
+    topk_idx = torch.topk(ex_weights, k=topk_prompts, dim=-1).indices
+    src, dst = [], []
+    for i in range(num_nodes):
+        for j in topk_idx[i].tolist():
+            src.extend([i, num_nodes + j])
+            dst.extend([num_nodes + j, i])
+    if len(src) == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+    return torch.tensor([src, dst], dtype=torch.long, device=device)
+
+
+def evaluate(model: DualBranchGNN, x: torch.Tensor, edge_index: torch.Tensor, split: Split, y: torch.Tensor) -> Dict[str, float]:
     model.eval()
-    aligner.eval()
     with torch.no_grad():
-        x_eval = aligner(data.x)
-        # 【修改点 1】：适配新的双分支返回值解包
-        logits_eval, h_final, h_frozen, h_adapted, gate_weight, ex_optimized = model(
-            x_eval, data.edge_index, p_homo, p_hete, hard_route=args.eval_hard_route
-        )
-        # 此时应该通过门控优化后的路由矩阵来判断连边
-        prompt_assignments = ex_optimized.argmax(dim=1)
-        true_labels = data.y.squeeze()
-
-        total_prompt_nodes = args.k_homo + args.k_hete
-        purity_scores = []
-        prompt_majority_labels = torch.full(
-            (total_prompt_nodes,), -1, dtype=true_labels.dtype, device=true_labels.device
-        )
-        for k in range(total_prompt_nodes):
-            connected_nodes = (prompt_assignments == k).nonzero(as_tuple=True)[0]
-            if len(connected_nodes) > 1:
-                labels_in_k = true_labels[connected_nodes]
-                bincount = torch.bincount(labels_in_k)
-                majority_class = bincount.argmax()
-                prompt_majority_labels[k] = majority_class
-                purity_scores.append(bincount[majority_class].item() / len(connected_nodes))
-
-        original_edge_homophily = homophily(data.edge_index, true_labels)
-        if len(purity_scores) == 0:
-            return original_edge_homophily, 0.0, 0.0
-
-        avg_prompt_purity = float(sum(purity_scores) / len(purity_scores))
-        node_indices = torch.arange(data.num_nodes, device=true_labels.device)
-        valid_node_mask = prompt_majority_labels[prompt_assignments] >= 0
-        if valid_node_mask.sum().item() > 0:
-            matched = (
-                true_labels[node_indices[valid_node_mask]]
-                == prompt_majority_labels[prompt_assignments[valid_node_mask]]
-            )
-            prompt_edge_homophily = matched.float().mean().item()
-        else:
-            prompt_edge_homophily = 0.0
-        return original_edge_homophily, prompt_edge_homophily, avg_prompt_purity
+        logits, _, _ = model(x, edge_index)
+        pred = logits.argmax(dim=-1)
+        return {
+            "train": float((pred[split.train_mask] == y[split.train_mask]).float().mean().item()) if split.train_mask.any() else 0.0,
+            "val": float((pred[split.val_mask] == y[split.val_mask]).float().mean().item()) if split.val_mask.any() else 0.0,
+            "test": float((pred[split.test_mask] == y[split.test_mask]).float().mean().item()) if split.test_mask.any() else 0.0,
+        }
 
 
-def train_once(args, seed):
+def run_one(args, seed: int) -> Dict[str, float]:
     set_seed(seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n===== Seed {seed} =====")
-    print(f"🚀 实验环境: {args.source_dataset} -> {args.target_dataset}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1) 加载数据
-    data, target_in_dim, target_out_dim = load_node_data(args.target_dataset, "./data")
-    data = data.to(device)
-    train_mask, val_mask, test_mask = build_masks(
-        data, args.shots, args.val_node_num, args.test_node_num, seed, device
+    dataset = load_dataset(args.dataset, args.data_root)
+    data = dataset[0].to(device)
+    split = build_few_shot_masks(data.y, shots=args.shots, seed=seed)
+
+    pretrained_path = os.path.join(args.pretrained_dir, args.pretrained_name)
+    if not os.path.exists(pretrained_path):
+        raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_path}")
+
+    inferred_source_dim, inferred_hidden_dim = infer_checkpoint_dims(pretrained_path, device)
+    source_dim = args.source_dim if args.source_dim is not None else inferred_source_dim
+    hidden_dim = args.hidden_dim if args.hidden_dim is not None else inferred_hidden_dim
+
+    backbone = load_pretrained_backbone(pretrained_path, in_channels=source_dim, hidden_channels=hidden_dim, device=device)
+    backbone.eval()
+    for p in backbone.parameters():
+        p.requires_grad = False
+
+    input_aligner = InputAligner(data.num_features, source_dim).to(device)
+
+    # Prompt generation uses source-aligned inputs and hidden-sized prompt prototypes.
+    generator = PromptGenerator(
+        k_homo=args.k_homo,
+        k_hete=args.k_hete,
+        device=str(device),
+        homophily_threshold=args.homophily_threshold,
+        hetero_clusterer=args.hetero_clusterer,
     )
+    p_homo, p_hete = generator.generate(data, backbone, input_aligner)
+    p_homo = normalize_prompt_dim(p_homo, hidden_dim)  # shape: [K1, hidden_dim]
+    p_hete = normalize_prompt_dim(p_hete, hidden_dim)  # shape: [K2, hidden_dim]
+    prompt_nodes_init = torch.cat([p_homo, p_hete], dim=0).detach()  # shape: [K1+K2, hidden_dim]
 
-    # 2) 初始化维度对齐层 (Aligner)
-    aligner = nn.Sequential(
-        nn.Linear(target_in_dim, args.source_dim),
-        nn.ReLU(),
-        nn.Linear(args.source_dim, args.source_dim)
+    # Stable prompt feature alignment into hidden space. Recomputed every epoch.
+    prompt_feature_aligner = PromptFeatureAligner(prompt_nodes_init.size(-1), hidden_dim).to(device)
+
+    # Differentiable routing from source-aligned node features to prompt nodes.
+    router = GumbelRouter(feature_dim=source_dim, prompt_dim=hidden_dim, tau=args.tau).to(device)
+
+    model = DualBranchGNN(
+        pretrained_backbone=backbone,
+        hidden_dim=hidden_dim,
+        out_dim=dataset.num_classes,
+        prompt_dim=hidden_dim,
+        bottleneck_dim=args.bottleneck_dim,
+        input_dim=source_dim,
     ).to(device)
 
-    # 3) 加载源域预训练模型
-    weight_file = f"./pretrained_gnns/{args.source_dataset}_SimGRACE_GCN_1.pth"
-    pretrained_backbone = load_pretrained_backbone(
-        weight_path=weight_file,
-        in_channels=args.source_dim,
-        hidden_channels=args.hidden_dim,
-        device=device,
-    )
-
-    # 4) 生成静态提示
-    print(f"\n🔮 正在基于预训练 GNN 提取 {args.target_dataset} 的同配/异配神经锚点...")
-    generator = PromptGenerator(k_homo=args.k_homo, k_hete=args.k_hete, device=device)
-    p_homo, p_hete = generator.generate(data, pretrained_backbone, aligner)
-
-    # 5) 构建双分支模型
-    model = DualBranchCrossDomainGNN(
-        pretrained_gnn=pretrained_backbone,
-        hidden_channels=args.hidden_dim,
-        out_channels=target_out_dim,
-        prompt_homo_dim=p_homo.size(-1),
-        prompt_hete_dim=p_hete.size(-1),
-        tau=args.tau,
-        adapter_r=args.adapter_r
-    ).to(device)
-
-    # 初始化路由器的温度
-    model.global_router.tau = args.tau
-
-    # 6) 优化器
-    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(aligner.parameters())
+    trainable_params = list(model.parameters()) + list(input_aligner.parameters()) + list(prompt_feature_aligner.parameters()) + list(router.parameters())
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
-    # 7) 训练循环
-    best_val_acc = -1.0
-    best_test_acc = 0.0
-    best_state = None
-    wait = 0
-    labels = data.y.squeeze()
+    best_val = 0.0
+    best_test = 0.0
+    final_test = 0.0
+    is_homophilic = infer_edge_homophily(data) >= args.homophily_threshold
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        aligner.train()
+        input_aligner.train()
+        prompt_feature_aligner.train()
+        router.train()
         optimizer.zero_grad()
 
-        x_aligned = aligner(data.x)
-        
-        # 【修改点 2】：解包最新的返回值，获取残差门控权重 gate_weight
-        logits, h_final, h_frozen, h_adapted, gate_weight, ex_optimized = model(
-            x_aligned, data.edge_index, p_homo, p_hete, hard_route=args.train_hard_route
+        x_aligned = input_aligner(data.x)  # shape: [N, source_dim]
+        prompt_nodes = prompt_feature_aligner(prompt_nodes_init)  # shape: [K, hidden_dim]
+        ex_weights = router(x_aligned, prompt_nodes, hard=args.hard_route)  # shape: [N, K]
+        prompt_edge_index = build_prompt_edges(ex_weights, data.num_nodes, args.topk_prompts, device=device)
+        full_edge_index = torch.cat([data.edge_index, prompt_edge_index], dim=1) if prompt_edge_index.numel() > 0 else data.edge_index
+        edge_type = torch.cat(
+            [
+                torch.zeros(data.edge_index.size(1), dtype=torch.long, device=device),
+                torch.ones(prompt_edge_index.size(1), dtype=torch.long, device=device),
+            ],
+            dim=0,
+        ) if prompt_edge_index.numel() > 0 else torch.zeros(data.edge_index.size(1), dtype=torch.long, device=device)
+
+        logits, _, h_adapted = model(
+            x_aligned,
+            data.edge_index,
+            prompt_nodes=prompt_nodes,
+            prompt_edge_index=full_edge_index,
+            edge_type=edge_type,
         )
 
-        loss_cls = F.cross_entropy(logits[train_mask], labels[train_mask])
-        
-        # 【修改点 3】：稀疏损失作用于经过门控截断后的 ex_optimized，只约束活跃的节点
-        loss_sparse = -torch.mean(torch.sum(ex_optimized * torch.log(ex_optimized + 1e-8), dim=-1))
-        
-        # 【修改点 4】：极其关键的选择性一致性损失 (Selective Consistency)
-        # 计算逐节点差异
-        mse_diff = F.mse_loss(h_adapted, h_frozen, reduction='none').mean(dim=-1, keepdim=True)
-        if args.consist_on_train_only:
-            # 对于同配好节点(gate_weight小)，施加强约束；对于异配坏节点(gate_weight大)，释放约束
-            loss_consist = torch.mean((1 - gate_weight[train_mask]) * mse_diff[train_mask])
-        else:
-            loss_consist = torch.mean((1 - gate_weight) * mse_diff)
+        train_logits = logits[split.train_mask]
+        train_y = data.y[split.train_mask]
 
-        # 路由分布一致性（同样替换为 ex_optimized）
-        route_consist_terms = []
-        train_labels = labels[train_mask]
-        for cls in train_labels.unique():
-            cls_mask = train_mask & (labels == cls)
-            if cls_mask.sum().item() > 1:
-                ex_cls = ex_optimized[cls_mask]
-                cls_center = ex_cls.mean(dim=0, keepdim=True)
-                route_consist_terms.append(F.mse_loss(ex_cls, cls_center.expand_as(ex_cls)))
-        loss_route_consist = torch.stack(route_consist_terms).mean() if route_consist_terms else torch.tensor(0.0, device=device)
+        ce_loss = F.cross_entropy(train_logits, train_y)
+        sparse_loss = ex_weights.mean()
+        consist_loss = consistency_loss(logits, logits.detach()) if logits.size(0) > 1 else torch.tensor(0.0, device=device)
+        contrastive_loss = prompt_edge_contrastive_loss(h_adapted, ex_weights)
 
-        consist_weight = get_consistency_weight(epoch, args)
-        loss = (
-            loss_cls
-            + args.lambda_sparse * loss_sparse
-            + consist_weight * loss_consist
-            + args.lambda_route_consist * loss_route_consist
-        )
-        loss.backward()
+        total_loss = ce_loss + args.lambda1 * sparse_loss + (args.lambda2 * (0.25 if is_homophilic else 2.0)) * consist_loss + args.lambda3 * contrastive_loss
+        total_loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip)
         optimizer.step()
-        
-        # 【修改点 5】：动态进行 Gumbel-Softmax 的温度退火
-        model.global_router.tau = max(args.min_tau, model.global_router.tau * args.tau_decay)
 
-        if epoch % args.eval_every == 0 or epoch == 1:
-            model.eval()
-            aligner.eval()
-            with torch.no_grad():
-                x_eval = aligner(data.x)
-                # 评估时也适配新的返回值
-                logits_eval, _, _, _, avg_gate_eval, _ = model(
-                    x_eval, data.edge_index, p_homo, p_hete, hard_route=args.eval_hard_route
-                )
-                train_acc = compute_acc(logits_eval, labels, train_mask)
-                val_acc = compute_acc(logits_eval, labels, val_mask)
-                test_acc = compute_acc(logits_eval, labels, test_mask)
+        acc = evaluate(model, x_aligned.detach(), data.edge_index, split, data.y)
+        final_test = acc["test"]
+        if acc["val"] > best_val:
+            best_val = acc["val"]
+            best_test = acc["test"]
 
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_test_acc = test_acc
-                wait = 0
-                best_state = {
-                    "model": copy.deepcopy(model.state_dict()),
-                    "aligner": copy.deepcopy(aligner.state_dict()),
-                }
-            else:
-                wait += 1
-
+        if epoch % args.log_every == 0 or epoch == 1:
             print(
-                f"Epoch {epoch:03d} | Loss: {loss.item():.4f} "
-                f"(Cls: {loss_cls.item():.4f}, Sparse: {loss_sparse.item():.4f}, "
-                f"Consist: {loss_consist.item():.4f}) "
-                f"| Tau: {model.global_router.tau:.4f} | Gate Avg: {avg_gate_eval.mean().item():.4f} "
-                f"| Train/Val/Test: {train_acc*100:.2f}/{val_acc*100:.2f}/{test_acc*100:.2f} "
-                f"| BestVal: {best_val_acc*100:.2f} | BestTest@BestVal: {best_test_acc*100:.2f}"
+                f"Epoch {epoch:03d} | Loss {float(total_loss.item()):.4f} | CE {float(ce_loss.item()):.4f} | "
+                f"Sparse {float(sparse_loss.item()):.4f} | Consist {float(consist_loss.item()):.4f} | "
+                f"Contrast {float(contrastive_loss.item()):.4f} | Val {acc['val']:.4f} | Test {acc['test']:.4f}"
             )
 
-            if wait >= args.patience:
-                print(f"⏹️ Early stopping at epoch {epoch}")
-                break
-
-    if best_state is not None:
-        model.load_state_dict(best_state["model"])
-        aligner.load_state_dict(best_state["aligner"])
-
-    print(f"\n🎉 Seed {seed} 完成！Best Test Acc: {best_test_acc*100:.2f}%")
-    edge_h, prompt_edge_h, prompt_purity = analyze_prompt_homophily(model, aligner, data, p_homo, p_hete, args)
-    print(f"📉 原图边级同配率: {edge_h:.4f} | 📈 提示边级同配率: {prompt_edge_h:.4f} | 🧪 提示簇纯度 (Prompt Purity): {prompt_purity:.4f}")
-    return best_test_acc
+    return {
+        "best_val": best_val,
+        "best_test": best_test,
+        "final_test": final_test,
+        "homophily": infer_edge_homophily(data),
+    }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--target_dataset', type=str, default='Amazon-ratings')
-    parser.add_argument('--source_dataset', type=str, default='PubMed')
-    parser.add_argument('--source_dim', type=int, default=500)
-    parser.add_argument('--hidden_dim', type=int, default=128)
-    parser.add_argument('--adapter_r', type=int, default=8)
-    parser.add_argument('--shots', type=int, default=5)
-    parser.add_argument('--val_node_num', type=int, default=1000)
-    parser.add_argument('--test_node_num', type=int, default=1000)
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--weight_decay', type=float, default=5e-3)
-    parser.add_argument('--eval_every', type=int, default=10)
-    parser.add_argument('--patience', type=int, default=10)
-    parser.add_argument('--seeds', type=str, default='42')
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Stable end-to-end 5-shot training pipeline")
+    parser.add_argument("--dataset", type=str, default="Cora")
+    parser.add_argument("--data_root", type=str, default="./data")
+    parser.add_argument("--pretrained_dir", type=str, default="./pretrained_gnns")
+    parser.add_argument("--pretrained_name", type=str, default="PubMed_SimGRACE_GCN_1.pth")
+    parser.add_argument("--source_dim", type=int, default=None)
+    parser.add_argument("--hidden_dim", type=int, default=None)
+    parser.add_argument("--bottleneck_dim", type=int, default=32)
+    parser.add_argument("--k_homo", type=int, default=10)
+    parser.add_argument("--k_hete", type=int, default=10)
+    parser.add_argument("--homophily_threshold", type=float, default=0.5)
+    parser.add_argument("--hetero_clusterer", type=str, default="gmm", choices=["gmm", "spectral"])
+    parser.add_argument("--shots", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=5e-4)
+    parser.add_argument("--lambda1", type=float, default=1.0)
+    parser.add_argument("--lambda2", type=float, default=1.0)
+    parser.add_argument("--lambda3", type=float, default=1.0)
+    parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument("--hard_route", action="store_true")
+    parser.add_argument("--topk_prompts", type=int, default=1)
+    parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--log_every", type=int, default=20)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    args = parser.parse_args()
 
-    parser.add_argument('--k_homo', type=int, default=10)
-    parser.add_argument('--k_hete', type=int, default=10)
-    parser.add_argument('--tau', type=float, default=1.0)
-    parser.add_argument('--tau_decay', type=float, default=0.98)
-    parser.add_argument('--min_tau', type=float, default=0.1)
-    parser.add_argument('--lambda_sparse', type=float, default=0.05)
-    parser.add_argument('--lambda_consist', type=float, default=0.1)
-    parser.add_argument('--consist_warmup_epochs', type=int, default=30)
-    parser.add_argument('--consist_min_ratio', type=float, default=0.1)
-    parser.add_argument('--consist_on_train_only', action='store_true')
-    parser.add_argument('--lambda_route_consist', type=float, default=0.1)
-    parser.add_argument('--train_hard_route', action='store_true')
-    parser.add_argument('--eval_hard_route', action='store_true')
-    return parser.parse_args()
+    results = []
+    for r in range(args.runs):
+        out = run_one(args, seed=args.seed + r)
+        results.append(out)
+        print(
+            f"Run {r+1}/{args.runs} | Best Val {out['best_val']:.4f} | "
+            f"Best Test {out['best_test']:.4f} | Final Test {out['final_test']:.4f} | Homophily {out['homophily']:.4f}"
+        )
+
+    mean_best = sum(x["best_test"] for x in results) / len(results)
+    mean_final = sum(x["final_test"] for x in results) / len(results)
+    print("\n===== Summary =====")
+    print(f"Dataset: {args.dataset}")
+    print(f"5-shot runs: {args.runs}")
+    print(f"Mean Best Test Acc: {mean_best:.4f}")
+    print(f"Mean Final Test Acc: {mean_final:.4f}")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    active_seeds = [int(s.strip()) for s in args.seeds.split(',')]
-    all_test_accs = []
-    for seed in active_seeds:
-        acc = train_once(args, seed)
-        all_test_accs.append(acc)
-    
-    print("\n" + "=" * 44)
-    print("📦 最终复现实验汇总")
-    print("=" * 44)
-    print(f"Test Acc: {np.mean(all_test_accs)*100:.2f}% ± {np.std(all_test_accs)*100:.2f}%")
+    main()

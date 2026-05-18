@@ -1,79 +1,128 @@
+# models/dual_branch.py
+from __future__ import annotations
+
+import copy
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
-import copy
-from prompts.global_router import GlobalGumbelRouter
 
-class DualBranchCrossDomainGNN(nn.Module):
-    def __init__(self, pretrained_gnn, hidden_channels, out_channels, prompt_homo_dim, prompt_hete_dim, tau=1.0, adapter_r=8):
+from models.gp2f_adapter import GP2FAdapter
+from models.prompt_conv import PromptAwareGNNConv
+
+
+class OrthogonalProjection(nn.Module):
+    """Feature-preserving orthogonal projection for dimension alignment."""
+
+    def __init__(self, in_dim: int, out_dim: int) -> None:
         super().__init__()
-        self.hidden_dim = hidden_channels
-        
-        # 1. 冻结分支 (老专家，保留源域知识)
-        self.frozen_branch = pretrained_gnn
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.proj = nn.Linear(in_dim, out_dim, bias=False)
+        nn.init.orthogonal_(self.proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+class PromptBranchEncoder(nn.Module):
+    def __init__(self, hidden_dim: int, out_dim: int, num_layers: int = 2) -> None:
+        super().__init__()
+        layers = []
+        for _ in range(num_layers):
+            layers.append(PromptAwareGNNConv(hidden_dim, hidden_dim, alpha=0.5, beta=1.5))
+            layers.append(nn.ReLU())
+        self.layers = nn.ModuleList(layers)
+        self.out_proj = nn.Linear(hidden_dim, out_dim, bias=False)
+        nn.init.orthogonal_(self.out_proj.weight)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_type: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            if isinstance(layer, PromptAwareGNNConv):
+                x = layer(x, edge_index, edge_type=edge_type)  # shape: [N+K, D]
+            else:
+                x = layer(x)
+        return self.out_proj(x)
+
+
+class DualBranchGNN(nn.Module):
+    def __init__(
+        self,
+        pretrained_backbone,
+        hidden_dim: int,
+        out_dim: int,
+        prompt_dim: int,
+        bottleneck_dim: int = 32,
+        input_dim: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+
+        # 1. frozen branch
+        self.frozen_branch = copy.deepcopy(pretrained_backbone)
         for param in self.frozen_branch.parameters():
             param.requires_grad = False
-            
-        # 2. 适应分支 (学习目标域知识)
-        # 这里使用深拷贝预训练模型作为适应分支基础。如果你有专用的 GP2FAdapter，也可以在这替换。
-        self.adapted_branch = copy.deepcopy(pretrained_gnn)
-        for param in self.adapted_branch.parameters():
-            param.requires_grad = True
-            
-        # 3. 初始化残差稀疏路由器
-        # 注意：由于提示节点是在隐层空间 (128维) 聚类出来的，这里的特征维度使用隐层维度
-        self.global_router = GlobalGumbelRouter(feature_dim=prompt_homo_dim, tau=tau)
-        
-        # 4. 特征自适应门控融合层
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim, 1),
-            nn.Sigmoid()
-        )
-        
-        # 5. 最终分类器
-        self.classifier = nn.Linear(self.hidden_dim, out_channels)
-        
-        # 动态投影层 (用于将 128 维的 prompt 投回 500 维的原图特征空间)
-        self.prompt_up_proj = None
+        self.frozen_branch.eval()
 
-    def forward(self, x_aligned, edge_index, p_homo, p_hete, hard_route=False):
-        # 1. 冻结分支前向传播，得到先验表征 [N, 128]
+        # 2. adaptive branch
+        self.hidden_dim = hidden_dim
+        self.input_dim = input_dim if input_dim is not None else hidden_dim
+        self.x_proj = nn.Linear(self.input_dim, hidden_dim, bias=False)
+        nn.init.orthogonal_(self.x_proj.weight)
+        self.prompt_proj = nn.Linear(prompt_dim, hidden_dim, bias=False)
+        nn.init.orthogonal_(self.prompt_proj.weight)
+
+        self.adapter = GP2FAdapter(hidden_dim, r=bottleneck_dim)
+        self.prompt_branch = PromptBranchEncoder(hidden_dim, hidden_dim)
+
+        # gate initialized toward frozen branch: h_final = (1-gate)*frozen + gate*adapted
+        self.gate = nn.Parameter(torch.tensor(0.2))
+        self.classifier = nn.Linear(hidden_dim, out_dim)
+
+        self.domain_align = OrthogonalProjection(hidden_dim, hidden_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        prompt_nodes: Optional[torch.Tensor] = None,
+        prompt_edge_index: Optional[torch.Tensor] = None,
+        edge_type: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x shape: [N, F]
         with torch.no_grad():
-            self.frozen_branch.eval()
-            h_frozen = self.frozen_branch(x_aligned, edge_index)
-        
-        # 统一提示特征维度 (因为 p_hete 可能是拼接了残差的 256 维，需对齐回 128 维)
-        if p_hete.shape[-1] != p_homo.shape[-1]:
-            p_hete_aligned = p_hete[:, :p_homo.shape[-1]]
+            h_frozen = self.frozen_branch(x, edge_index)  # shape: [N, D]
+
+        h_frozen = self.domain_align(h_frozen)  # shape: [N, D]
+
+        if prompt_nodes is None:
+            prompt_nodes = x.new_zeros((0, self.hidden_dim))  # shape: [0, D]
+
+        x_base = self.x_proj(x) if x.size(-1) != self.hidden_dim else x  # shape: [N, D]
+
+        if prompt_nodes.numel() > 0:
+            if prompt_nodes.size(-1) != self.hidden_dim:
+                prompt_nodes = self.prompt_proj(prompt_nodes)  # shape: [K, D]
+            x_adapt = torch.cat([x_base, prompt_nodes], dim=0)  # shape: [N+K, D]
         else:
-            p_hete_aligned = p_hete
-        
-        # 2. 获取全局路由与门控权重
-        ex_optimized, gate_weight, ex_base, p_total = self.global_router(
-            x_aligned, h_frozen, p_homo, p_hete_aligned, hard=hard_route
-        )
-        
-        # 3. 【核心拓扑增强】通过路由矩阵拉取提示空间的同类特征 [N, 128]
-        m_prompt = torch.matmul(ex_optimized, p_total) 
-        
-        # 4. 【早期特征融合】在图卷积之前增强节点输入特征
-        # 因为 x_aligned 是 500 维，m_prompt 是 128 维，自动初始化投影层对齐
-        if self.prompt_up_proj is None or self.prompt_up_proj.in_features != m_prompt.shape[-1]:
-            self.prompt_up_proj = nn.Linear(m_prompt.shape[-1], x_aligned.shape[-1], bias=False).to(x_aligned.device)
-        
-        m_prompt_projected = self.prompt_up_proj(m_prompt)
-        x_enhanced = x_aligned + m_prompt_projected 
-        
-        # 5. 适应分支前向传播 (在增强后的同配特征上进行 Message Passing)
-        h_adapted = self.adapted_branch(x_enhanced, edge_index)
-        
-        # 6. 后期双分支门控融合
-        combined_features = torch.cat([h_frozen, h_adapted], dim=-1)
-        beta = self.fusion_gate(combined_features)
-        h_final = beta * h_adapted + (1 - beta) * h_frozen
-        
-        # 7. 分类器输出
-        logits = self.classifier(h_final)
-        
-        return logits, h_final, h_frozen, h_adapted, gate_weight, ex_optimized
+            x_adapt = x_base  # shape: [N, D]
+
+        if prompt_edge_index is None:
+            prompt_edge_index = edge_index
+        if edge_type is None:
+            edge_type = edge_index.new_zeros(edge_index.size(1), dtype=torch.long)
+
+        h_adapted_full = self.prompt_branch(x_adapt, prompt_edge_index, edge_type=edge_type)  # shape: [N+K, D]
+        h_adapted = h_adapted_full[: x.size(0), :]  # shape: [N, D]
+
+        h_adapted = self.adapter(h_adapted)  # shape: [N, D]
+
+        gate = torch.clamp(self.gate, 0.0, 1.0)
+        h_final = (1.0 - gate) * h_frozen + gate * h_adapted  # shape: [N, D]
+        logits = self.classifier(h_final)  # shape: [N, C]
+
+        return logits, h_frozen, h_adapted
