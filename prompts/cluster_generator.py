@@ -35,6 +35,8 @@ from sklearn.cluster import KMeans, SpectralClustering
 from sklearn.mixture import GaussianMixture
 
 from load_data import estimate_edge_homophily
+from prompts.gumbel_route import compute_local_heterophily, select_top_rho_pool
+from prompts.target_ssl import SSLMethod, fit_target_ssl_embeddings
 
 
 # =============================================================================
@@ -58,9 +60,11 @@ class PromptSignals:
         h_low:           [N, D_low]  低频平滑信号
         h_high:          [N, D_high] 高频残差（X 与 H_low 维度对齐后相减）
         h_aug:           [N, D_low + D_high] 双频拼接
+        z_target:        [N, D] 目标域无监督嵌入（仅 target_ssl 模式）
         edge_homophily:  float, 整图边同配率
         is_homophilic:   bool, 是否被视为同配图（依据 ``homophily_threshold`` 或外部强制）
-        hetero_clusterer_used: 实际使用的异配聚类器名称（kmeans / gmm / spectral）
+        hetero_clusterer_used: 实际使用的异配聚类器名称（kmeans / gmm / spectral / target_ssl）
+        pool_size:       Top-ρ 候选池大小（target_ssl 模式）
     """
 
     h_low: torch.Tensor
@@ -69,6 +73,8 @@ class PromptSignals:
     edge_homophily: float
     is_homophilic: bool
     hetero_clusterer_used: str
+    z_target: Optional[torch.Tensor] = None
+    pool_size: int = 0
 
 
 # =============================================================================
@@ -196,6 +202,82 @@ class PromptGenerator:
                     )
                 else:
                     # 空簇时随机重置一个球面点，避免 collapse
+                    fallback_idx = torch.randint(
+                        0, x_norm.size(0), (1,), generator=generator, device=x_norm.device
+                    ).item()
+                    new_centroids.append(x_norm[fallback_idx])
+            new_centroids = torch.stack(new_centroids, dim=0)
+
+            delta = torch.norm(new_centroids - centroids, p=2, dim=1).max().item()
+            centroids = new_centroids
+            if delta < tol:
+                break
+
+        return centroids
+
+    # ------------------------------------------------------------------
+    #  均衡球形 K-Means（目标域 SSL 嵌入 → P_homo）
+    # ------------------------------------------------------------------
+
+    def _balanced_spherical_kmeans(
+        self,
+        x: torch.Tensor,
+        n_clusters: int,
+        max_iter: int = 100,
+        tol: float = 1e-4,
+    ) -> torch.Tensor:
+        """球形 K-Means + 每簇近似均衡分配（greedy capacity）。"""
+        if x.size(0) < n_clusters:
+            raise ValueError(
+                f"均衡球形 K-Means 失败：样本数 {x.size(0)} < 聚类数 {n_clusters}"
+            )
+
+        n_samples = x.size(0)
+        base = n_samples // n_clusters
+        rem = n_samples % n_clusters
+        capacities = [base + (1 if i < rem else 0) for i in range(n_clusters)]
+
+        x_norm = self._safe_l2_normalize(x)
+        generator = torch.Generator(device=x_norm.device).manual_seed(self.random_state)
+        indices = torch.randperm(x_norm.size(0), generator=generator, device=x_norm.device)[
+            :n_clusters
+        ]
+        centroids = x_norm[indices].clone()
+
+        for _ in range(max_iter):
+            similarity = x_norm @ centroids.t()
+            flat_scores = similarity.reshape(-1)
+            order = torch.argsort(flat_scores, descending=True)
+            assigned = torch.full((n_samples,), -1, dtype=torch.long, device=x.device)
+            remaining = capacities.copy()
+
+            for flat_idx in order.tolist():
+                n = flat_idx // n_clusters
+                c = flat_idx % n_clusters
+                if assigned[n] >= 0:
+                    continue
+                if remaining[c] <= 0:
+                    continue
+                assigned[n] = c
+                remaining[c] -= 1
+
+            unassigned = (assigned < 0).nonzero(as_tuple=False).view(-1)
+            for n in unassigned.tolist():
+                for c in range(n_clusters):
+                    if remaining[c] > 0:
+                        assigned[n] = c
+                        remaining[c] -= 1
+                        break
+
+            new_centroids = []
+            for k in range(n_clusters):
+                mask = assigned == k
+                if mask.any():
+                    cluster_vec = x_norm[mask].mean(dim=0)
+                    new_centroids.append(
+                        self._safe_l2_normalize(cluster_vec.unsqueeze(0)).squeeze(0)
+                    )
+                else:
                     fallback_idx = torch.randint(
                         0, x_norm.size(0), (1,), generator=generator, device=x_norm.device
                     ).item()
@@ -383,5 +465,155 @@ class PromptGenerator:
             edge_homophily=float(homophily),
             is_homophilic=bool(is_homophilic_graph),
             hetero_clusterer_used=hetero_clusterer_used,
+            z_target=None,
+            pool_size=0,
+        )
+        return p_homo, p_hete, signals
+
+
+# =============================================================================
+#  TargetSSLPromptGenerator：目标域无监督嵌入 + 均衡/池内聚类
+# =============================================================================
+
+
+class TargetSSLPromptGenerator:
+    """在目标图上跑 GRACE/GAE/BGRL 得到 Z_target，再初始化 P_homo / P_hete。
+
+    流程（与用户选定方案一致）：
+        1. 无监督 SSL → Z_target（仅用 x / edge_index，不用标签）
+        2. P_homo = balanced spherical KMeans(Z_target)  全图
+        3. V_pool = Top-ρ 异配候选（基于特征异配度，无标签）
+        4. P_hete = spherical KMeans(Z_target[V_pool])
+    """
+
+    def __init__(
+        self,
+        k_homo: int = 10,
+        k_hete: int = 10,
+        device: str = "cpu",
+        ssl_method: SSLMethod = "grace",
+        ssl_epochs: int = 200,
+        ssl_lr: float = 0.01,
+        ssl_hidden_dim: Optional[int] = None,
+        ssl_out_dim: Optional[int] = None,
+        rho: float = 0.15,
+        feat_drop: float = 0.2,
+        edge_drop: float = 0.2,
+        random_state: int = 42,
+        graph_family: Optional[str] = None,
+        homophily_threshold: float = 0.5,
+    ) -> None:
+        self.k_homo = int(k_homo)
+        self.k_hete = int(k_hete)
+        self.device = torch.device(device)
+        self.ssl_method = ssl_method
+        self.ssl_epochs = int(ssl_epochs)
+        self.ssl_lr = float(ssl_lr)
+        self.ssl_hidden_dim = ssl_hidden_dim
+        self.ssl_out_dim = ssl_out_dim
+        self.rho = float(rho)
+        self.feat_drop = float(feat_drop)
+        self.edge_drop = float(edge_drop)
+        self.random_state = int(random_state)
+        self.graph_family = graph_family
+        self.homophily_threshold = float(homophily_threshold)
+        self._legacy = PromptGenerator(
+            k_homo=k_homo,
+            k_hete=k_hete,
+            device=device,
+            random_state=random_state,
+            graph_family=graph_family,
+            homophily_threshold=homophily_threshold,
+        )
+
+    def generate(
+        self,
+        data,
+        model: Optional[nn.Module] = None,
+        aligner: Optional[nn.Module] = None,
+        return_signals: bool = False,
+    ):
+        del model, aligner
+
+        homophily = estimate_edge_homophily(data.edge_index, data.y)
+        if self.graph_family is not None:
+            is_homophilic_graph = self.graph_family == "homophilic"
+        else:
+            is_homophilic_graph = homophily >= self.homophily_threshold
+
+        hidden = self.ssl_hidden_dim if self.ssl_hidden_dim is not None else 128
+        out_dim = self.ssl_out_dim if self.ssl_out_dim is not None else hidden
+
+        z_target, ssl_used = fit_target_ssl_embeddings(
+            data,
+            method=self.ssl_method,
+            hidden_dim=hidden,
+            out_dim=out_dim,
+            epochs=self.ssl_epochs,
+            lr=self.ssl_lr,
+            feat_drop=self.feat_drop,
+            edge_drop=self.edge_drop,
+            device=self.device,
+            verbose=True,
+        )
+
+        print(
+            f"[TargetSSLPromptGenerator] edge homophily = {homophily:.4f} | "
+            f"graph_family = {'homophilic' if is_homophilic_graph else 'heterophilic'}"
+        )
+        print(
+            f"[TargetSSLPromptGenerator] balanced spherical K-Means on Z_target "
+            f"→ P_homo (K1={self.k_homo})"
+        )
+        with torch.no_grad():
+            p_homo = self._legacy._balanced_spherical_kmeans(z_target.detach(), self.k_homo)
+
+        local_h = compute_local_heterophily(
+            data.edge_index,
+            data.num_nodes,
+            y=None,
+            x=data.x.to(z_target.device),
+        )
+        pool_mask, pool_indices = select_top_rho_pool(local_h, self.rho)
+        pool_size = int(pool_indices.numel())
+        print(
+            f"[TargetSSLPromptGenerator] V_pool = {pool_size} nodes (rho={self.rho:.3f}, "
+            f"feature heterophily, no labels)"
+        )
+
+        z_pool = z_target[pool_mask]
+        k_hete_eff = min(self.k_hete, max(1, z_pool.size(0)))
+        if k_hete_eff < self.k_hete:
+            print(
+                f"[TargetSSLPromptGenerator] k_hete adjusted {self.k_hete} → {k_hete_eff} "
+                f"(pool size)"
+            )
+        print(
+            f"[TargetSSLPromptGenerator] spherical K-Means on Z_target[V_pool] "
+            f"→ P_hete (K2={k_hete_eff})"
+        )
+        with torch.no_grad():
+            p_hete = self._legacy._spherical_kmeans(z_pool.detach(), k_hete_eff)
+
+        target_dim = p_homo.size(-1)
+        p_hete = PromptGenerator._align_prompt_dim(p_hete, target_dim)
+        p_homo = nn.Parameter(p_homo.to(self.device), requires_grad=True)
+        p_hete = nn.Parameter(p_hete.to(self.device), requires_grad=True)
+
+        if not return_signals:
+            return p_homo, p_hete
+
+        h_low = z_target
+        h_high = z_target.new_zeros(z_target.size(0), 0)
+        h_aug = z_target
+        signals = PromptSignals(
+            h_low=h_low,
+            h_high=h_high,
+            h_aug=h_aug,
+            edge_homophily=float(homophily),
+            is_homophilic=bool(is_homophilic_graph),
+            hetero_clusterer_used=f"target_ssl_{ssl_used}",
+            z_target=z_target,
+            pool_size=pool_size,
         )
         return p_homo, p_hete, signals

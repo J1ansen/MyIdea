@@ -160,7 +160,7 @@ class GumbelRouter(nn.Module):
     Args:
         feature_dim: 原图节点特征维度 d。
         prompt_dim:  提示原型维度 d_p。
-        tau:         Gumbel 温度，越小越接近 one-hot。
+        tau:         Gumbel 初始温度，越小越接近 one-hot。
         rho:         默认 Top-ρ 比例；前向时可通过 ``rho`` / ``pool_mask`` 覆盖。
     """
 
@@ -176,6 +176,9 @@ class GumbelRouter(nn.Module):
         self.rho = float(rho)
         # 把节点特征投影到提示空间，便于 logits = h_proj @ p^T 度量"匹配度"
         self.proj = nn.Linear(feature_dim, prompt_dim)
+        nn.init.xavier_uniform_(self.proj.weight, gain=2.0)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
 
     def compute_pool_mask(
         self,
@@ -202,16 +205,21 @@ class GumbelRouter(nn.Module):
         rho: Optional[float] = None,
         pool_mask: Optional[torch.Tensor] = None,
         return_aux: bool = False,
+        tau: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
         """Gumbel 路由：只有 V_pool 内节点对应行非零，池外恒为 0。
 
         当 ``pool_mask`` 已提供时，直接复用（多路路由器共享同一池的关键）。
+
+        Args:
+            tau: 当前退火温度；若为 None 则使用构造时设定的 ``self.tau``。
         """
         num_nodes = node_features.size(0)
         h_proj = self.proj(node_features)
         logits = torch.matmul(h_proj, prompt_features.t())  # [N, K]
 
         effective_rho = self.rho if rho is None else float(rho)
+        effective_tau = self.tau if tau is None else float(tau)
         local_h = None
 
         # 准备候选池
@@ -230,7 +238,7 @@ class GumbelRouter(nn.Module):
         ex = torch.zeros_like(logits)
         if pool_mask.any():
             ex[pool_mask] = F.gumbel_softmax(
-                logits[pool_mask], tau=self.tau, hard=hard, dim=-1
+                logits[pool_mask], tau=effective_tau, hard=hard, dim=-1
             )
 
         if not return_aux:
@@ -288,7 +296,10 @@ class PromptRouter(nn.Module):
         prompt_dim:  提示原型维度（应与 P_homo / P_hete 对齐）。
         k_homo:      K1，同配提示数量。
         k_hete:      K2，异配提示数量。
-        tau:         Gumbel 温度。
+        tau:         Gumbel 初始温度（训练开始时使用）。
+        tau_end:     Gumbel 最终温度（退火目标值，默认 0.1）。
+                     训练过程中由外部调用 ``anneal_tau(epoch, total_epochs)``
+                     或在 ``forward`` 里传入当前 ``tau`` 覆盖。
         rho:         Top-ρ 默认比例。
     """
 
@@ -299,17 +310,47 @@ class PromptRouter(nn.Module):
         k_homo: int,
         k_hete: int,
         tau: float = 1.0,
+        tau_end: float = 0.1,
         rho: float = 0.3,
     ):
         super().__init__()
         self.k_homo = int(k_homo)
         self.k_hete = int(k_hete)
         self.tau = float(tau)
+        self.tau_end = float(tau_end)
         self.rho = float(rho)
+        self._current_tau = float(tau)  # 由外部 set_tau / anneal_tau 更新
 
         # 两路独立投影：保留 P_homo / P_hete 各自的几何
         self.router_homo = GumbelRouter(feature_dim, prompt_dim, tau=tau, rho=rho)
         self.router_hete = GumbelRouter(feature_dim, prompt_dim, tau=tau, rho=rho)
+
+    # ------------------------------------------------------------------
+    #  tau 退火工具
+    # ------------------------------------------------------------------
+
+    def anneal_tau(self, epoch: int, total_epochs: int) -> float:
+        """指数退火：tau = tau_start * (tau_end / tau_start)^(epoch / total_epochs)。
+
+        在训练循环每个 epoch 开始前调用，返回当前有效温度。
+        """
+        if total_epochs <= 1:
+            self._current_tau = self.tau_end
+            return self._current_tau
+        progress = min(max(float(epoch - 1) / float(total_epochs - 1), 0.0), 1.0)
+        if self.tau_end <= 0 or self.tau <= 0:
+            self._current_tau = max(self.tau_end, 1e-6)
+        else:
+            log_ratio = (self.tau_end / self.tau)
+            self._current_tau = float(self.tau * (log_ratio ** progress))
+        return self._current_tau
+
+    def set_tau(self, tau: float) -> None:
+        """手动设置当前温度（用于外部自定义退火策略）。"""
+        self._current_tau = float(tau)
+
+    def get_current_tau(self) -> float:
+        return self._current_tau
 
     # ------------------------------------------------------------------
     #  构造方法：与 load_data 的数据集 profile 对齐
@@ -324,6 +365,7 @@ class PromptRouter(nn.Module):
         k_homo: int,
         k_hete: int,
         tau: float = 1.0,
+        tau_end: float = 0.1,
         rho: Optional[float] = None,
     ) -> "PromptRouter":
         """按 ``DatasetProfile.default_rho`` 自动构造，与 README §8 默认 ρ 对齐。"""
@@ -334,6 +376,7 @@ class PromptRouter(nn.Module):
             k_homo=k_homo,
             k_hete=k_hete,
             tau=tau,
+            tau_end=tau_end,
             rho=effective_rho,
         )
 
@@ -352,6 +395,7 @@ class PromptRouter(nn.Module):
         topk: int = 1,
         rho: Optional[float] = None,
         pool_mask: Optional[torch.Tensor] = None,
+        tau: Optional[float] = None,
     ) -> PromptRoutingOutput:
         """生成 EX_homo / EX_hete + 拼装好的提示边。
 
@@ -365,12 +409,14 @@ class PromptRouter(nn.Module):
             topk:       每个池内节点最多连多少个**同类**提示（默认 1，符合一跳邻居语义）。
             rho:        覆盖默认 ρ。
             pool_mask:  覆盖默认池（高级用法）。
+            tau:        当前退火温度；若为 None 则使用 ``_current_tau``。
 
         Returns:
             PromptRoutingOutput
         """
         num_nodes = x.size(0)
         effective_rho = self.rho if rho is None else float(rho)
+        effective_tau = self._current_tau if tau is None else float(tau)
 
         # 1) 共享一个 V_pool（保证 homo / hete 路由在同一组节点上竞争）
         local_h = None
@@ -383,12 +429,12 @@ class PromptRouter(nn.Module):
                 pool_mask = torch.ones(num_nodes, dtype=torch.bool, device=x.device)
                 local_h = compute_local_heterophily(edge_index, num_nodes, y=y, x=x)
 
-        # 2) 两路 Gumbel 路由（共享池）
+        # 2) 两路 Gumbel 路由（共享池 + 当前退火温度）
         ex_homo, aux_homo = self.router_homo(
-            x, p_homo, hard=hard, pool_mask=pool_mask, return_aux=True
+            x, p_homo, hard=hard, pool_mask=pool_mask, return_aux=True, tau=effective_tau
         )
         ex_hete, aux_hete = self.router_hete(
-            x, p_hete, hard=hard, pool_mask=pool_mask, return_aux=True
+            x, p_hete, hard=hard, pool_mask=pool_mask, return_aux=True, tau=effective_tau
         )
 
         # 3) 构建提示边（PyG 形式）

@@ -40,13 +40,18 @@ class LossConfig:
 
     若 `is_homophilic = True`，consistency 实际权重 = ``lambda2 * lambda2_homo_mult``；
     否则 = ``lambda2 * lambda2_hete_mult``。
+
+    训练稳定性（默认开启）：
+        - ``normalize_contrastive``：对比前 L2 归一化嵌入，避免 dist 爆炸；
+        - ``consist_max``：对称 KL 上限，防止 Gate 升高时 Consist 失控；
+        - ``loss_warmup_epochs``：前若干 epoch 线性增大 λ1/λ2/λ3，先学好 CE。
     """
 
     # 总体权重
-    lambda1: float = 1.0          # L_sparse
-    lambda2: float = 1.0          # L_consist 基准权重
-    lambda3_homo: float = 1.0     # L_contrastive_homo
-    lambda3_hete: float = 1.0     # L_contrastive_hete
+    lambda1: float = 0.01         # L_sparse
+    lambda2: float = 0.05         # L_consist 基准权重（同配图上再 ×0.25）
+    lambda3_homo: float = 0.1     # L_contrastive_homo
+    lambda3_hete: float = 0.1     # L_contrastive_hete
 
     # 动态 λ2 的两档乘数（同配 / 异配）
     lambda2_homo_mult: float = 0.25
@@ -55,7 +60,13 @@ class LossConfig:
     # 对比损失
     contrastive_margin: float = 1.0
     contrastive_sample_size: int = 512  # 0 表示不采样、用全图（小图）
-    contrastive_use_hard: bool = True   # True: 按 argmax 判同 prompt；False: 用软相似度
+    contrastive_use_hard: bool = False  # False: 软 EX 相似度（更稳）
+
+    # 稳定性
+    normalize_contrastive: bool = True
+    consist_max: float = 1.0
+    loss_warmup_epochs: int = 50
+    current_epoch: int = 1
 
 
 # =============================================================================
@@ -72,6 +83,13 @@ def sparsity_loss(ex: torch.Tensor) -> torch.Tensor:
     if ex is None or ex.numel() == 0:
         return torch.tensor(0.0)
     return ex.mean()
+
+
+def loss_warmup_factor(epoch: int, warmup_epochs: int) -> float:
+    """前 ``warmup_epochs`` 个 epoch 将辅助损失权重从 0 线性升到 1。"""
+    if warmup_epochs <= 0:
+        return 1.0
+    return min(1.0, max(float(epoch), 1.0) / float(warmup_epochs))
 
 
 def consistency_loss(
@@ -158,7 +176,7 @@ def prompt_edge_contrastive_loss(
     else:
         idx = idx_all
 
-    h_s = h[idx]    # [S, D]
+    h_s = h[idx]  # [S, D]
     ex_s = ex[idx]  # [S, K]
 
     same = _same_prompt_matrix(ex_s, use_hard=use_hard)       # [S, S]
@@ -169,11 +187,14 @@ def prompt_edge_contrastive_loss(
     if pos_count.item() == 0:
         return h.new_tensor(0.0)
 
-    # 3) 成对距离
-    dist = torch.cdist(h_s, h_s, p=2)                         # [S, S]
+    # 3) 安全成对距离：避免 cdist/sqrt 在 dist=0 时 backward 出现 NaN
+    diff = h_s.unsqueeze(1) - h_s.unsqueeze(0)                # [S, S, D]
+    dist_sq = (diff ** 2).sum(dim=-1)                         # [S, S]
+    eps = h_s.new_tensor(1e-8)
+    dist = torch.sqrt(dist_sq + eps)
 
-    # 同 prompt → 拉近（最小化 dist²）
-    pos_loss = (same * dist.pow(2)).sum() / (pos_count + 1e-8)
+    # 同 prompt → 拉近（直接用 dist_sq，不经过 sqrt）
+    pos_loss = (same * dist_sq).sum() / (pos_count + 1e-8)
     # 不同 prompt → 推远（hinge: max(0, margin - dist)²）
     neg_mask = (1.0 - same) * (1.0 - eye)
     neg_count = neg_mask.sum()
@@ -366,8 +387,10 @@ def compute_total_loss(
     sparse_e = sparsity_loss(ex_hete)
     sparse = 0.5 * (sparse_h + sparse_e)
 
-    # 3) 双分支一致性（动态 λ2）
+    # 3) 双分支一致性（动态 λ2，带上限避免 KL 爆炸）
     consist = consistency_loss(logits_frozen, logits_adapted)
+    if cfg.consist_max > 0:
+        consist = consist.clamp(max=float(cfg.consist_max))
     lambda2_eff = dynamic_lambda2(
         is_homophilic,
         base_lambda2=cfg.lambda2,
@@ -375,9 +398,15 @@ def compute_total_loss(
         hete_mult=cfg.lambda2_hete_mult,
     )
 
-    # 4) 分路对比损失
+    aux_scale = loss_warmup_factor(cfg.current_epoch, cfg.loss_warmup_epochs)
+
+    # 4) 分路对比损失（嵌入在函数内已 L2 归一化）
+    h_contrast = h_for_contrast
+    if cfg.normalize_contrastive:
+        h_contrast = F.normalize(h_for_contrast, p=2, dim=-1, eps=1e-8)
+
     contrast_homo = prompt_edge_contrastive_loss(
-        h_for_contrast,
+        h_contrast,
         ex_homo,
         margin=cfg.contrastive_margin,
         sample_size=cfg.contrastive_sample_size,
@@ -385,7 +414,7 @@ def compute_total_loss(
         pool_mask=pool_mask,
     )
     contrast_hete = prompt_edge_contrastive_loss(
-        h_for_contrast,
+        h_contrast,
         ex_hete,
         margin=cfg.contrastive_margin,
         sample_size=cfg.contrastive_sample_size,
@@ -393,13 +422,13 @@ def compute_total_loss(
         pool_mask=pool_mask,
     )
 
-    # 5) 组装总损失
+    # 5) 组装总损失（辅助项 × warmup）
     total = (
         ce
-        + cfg.lambda1 * sparse
-        + lambda2_eff * consist
-        + cfg.lambda3_homo * contrast_homo
-        + cfg.lambda3_hete * contrast_hete
+        + aux_scale * cfg.lambda1 * sparse
+        + aux_scale * lambda2_eff * consist
+        + aux_scale * cfg.lambda3_homo * contrast_homo
+        + aux_scale * cfg.lambda3_hete * contrast_hete
     )
 
     # 6) 可选：提示边同配率指标（不进损失）

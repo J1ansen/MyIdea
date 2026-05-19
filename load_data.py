@@ -42,6 +42,10 @@ class DatasetProfile:
         name: 规范名称（PyG 类参数）。
         family: ``"homophilic"`` 或 ``"heterophilic"``，决定 λ2、聚类策略等行为。
         default_rho: 阶段二 Top-ρ 候选池比例的默认值（异配族取较大值）。
+        default_k_homo: 同配提示节点数量，默认与目标域类别数对齐（同配图），
+                        或取小值（1）表示"仅需一个跨类桥梁"。
+        default_k_hete: 异配提示节点数量；异配丰富的数据集取较大值（=类别数），
+                        同配图仅需少量（如 1）隔离综述/跨界节点。
         p_homo_role: 同配提示节点在该数据集上的拓扑语义。
         p_hete_role: 异配提示节点在该数据集上的拓扑语义。
     """
@@ -49,6 +53,8 @@ class DatasetProfile:
     name: str
     family: str
     default_rho: float
+    default_k_homo: int
+    default_k_hete: int
     p_homo_role: str
     p_hete_role: str
 
@@ -58,12 +64,17 @@ class DatasetProfile:
 
 
 # 8 个 benchmark 的 profile（顺序仅作展示，无功能影响）
+# default_k_homo / default_k_hete 设计原则：
+#   同配图：k_homo = 类别数（每类一个语义枢纽），k_hete = 1（少量跨界桥梁足矣）
+#   异配图：k_homo = k_hete = 类别数（homo/hete 语义模式同样丰富）
 DATASET_PROFILES: Dict[str, DatasetProfile] = {
     # ---- 强同配 / 隐含异配族（idea 第四节 8.2）----
     "Cora": DatasetProfile(
         name="Cora",
         family="homophilic",
         default_rho=0.15,
+        default_k_homo=7,   # 7 个论文领域，每类一个同配枢纽
+        default_k_hete=1,   # 仅需 1 个"综述隔离"节点
         p_homo_role="语义填补器：在同领域但未互引的论文之间补连边（虚拟主题会议）",
         p_hete_role="跨学科综述隔离：聚合跨领域综述论文，避免它们在 MP 中导致过平滑",
     ),
@@ -71,6 +82,8 @@ DATASET_PROFILES: Dict[str, DatasetProfile] = {
         name="CiteSeer",
         family="homophilic",
         default_rho=0.15,
+        default_k_homo=6,   # 6 类
+        default_k_hete=1,
         p_homo_role="语义填补器：补全同主题论文的缺失引用",
         p_hete_role="跨主题桥梁：隔离跨学科节点，缓解噪声扩散",
     ),
@@ -78,6 +91,8 @@ DATASET_PROFILES: Dict[str, DatasetProfile] = {
         name="PubMed",
         family="homophilic",
         default_rho=0.15,
+        default_k_homo=3,   # 3 类（Diabetes I/II/Experimental）
+        default_k_hete=1,
         p_homo_role="语义填补器：聚合同领域生医论文",
         p_hete_role="跨领域综述隔离：避免综述类论文导致的特征平滑",
     ),
@@ -85,6 +100,8 @@ DATASET_PROFILES: Dict[str, DatasetProfile] = {
         name="Amazon-ratings",
         family="homophilic",
         default_rho=0.20,
+        default_k_homo=5,   # 5 个评分等级
+        default_k_hete=2,   # 跨品类桥梁略多（百搭配件模式多样）
         p_homo_role="共购同配填补：相似商品在评分图上的同盟",
         p_hete_role="功能跨界桥梁：将跨品类「百搭爆款配件」隔离聚合，阻断跨主品类污染",
     ),
@@ -92,6 +109,8 @@ DATASET_PROFILES: Dict[str, DatasetProfile] = {
         name="Flickr",
         family="homophilic",
         default_rho=0.20,
+        default_k_homo=7,   # Flickr 标签体系丰富，取 7 作默认
+        default_k_hete=2,
         p_homo_role="视觉相似图像聚合：补连无元数据关联的视觉相似图像",
         p_hete_role="跨标签功能桥梁：隔离跨主题高度互联的图像",
     ),
@@ -100,6 +119,8 @@ DATASET_PROFILES: Dict[str, DatasetProfile] = {
         name="Minesweeper",
         family="heterophilic",
         default_rho=0.35,
+        default_k_homo=2,   # 二分类（mine/safe），homo/hete 各 2
+        default_k_hete=2,
         p_homo_role="长尾同盟：将边缘安全节点在输入层聚拢",
         p_hete_role="孤岛直连通道：打破网格隔离，让地雷节点共享『危险模式矩阵』",
     ),
@@ -107,6 +128,8 @@ DATASET_PROFILES: Dict[str, DatasetProfile] = {
         name="Actor",
         family="heterophilic",
         default_rho=0.35,
+        default_k_homo=5,   # 5 类演员角色，homo 每类一个
+        default_k_hete=5,   # 跨界模式丰富，hete 同样取 5
         p_homo_role="小众题材同盟：聚拢特定流派的边缘演员",
         p_hete_role="跨流派配角通道：捕获『万金油』配角，隔离其共演噪声",
     ),
@@ -114,6 +137,8 @@ DATASET_PROFILES: Dict[str, DatasetProfile] = {
         name="squirrel",
         family="heterophilic",
         default_rho=0.40,
+        default_k_homo=5,   # 5 类维基页面
+        default_k_hete=5,
         p_homo_role="长尾页面同盟：聚拢冷门维基词条",
         p_hete_role="超级枢纽：直连跨领域高流量页面，防止被长尾稀释",
     ),

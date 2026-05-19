@@ -67,7 +67,9 @@ class PromptBranchEncoder(nn.Module):
         super().__init__()
         layers = []
         for _ in range(num_layers):
-            layers.append(PromptAwareGNNConv(hidden_dim, hidden_dim, alpha=0.5, beta=1.5))
+            # beta 过大易在 (N+K) 提示图上放大激活导致 NaN；略降并加 LayerNorm
+            layers.append(PromptAwareGNNConv(hidden_dim, hidden_dim, alpha=0.8, beta=1.0))
+            layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.ReLU())
         self.layers = nn.ModuleList(layers)
         self.out_proj = nn.Linear(hidden_dim, out_dim, bias=False)
@@ -90,6 +92,8 @@ class PromptBranchEncoder(nn.Module):
                 )  # shape: [N+K, D]
             else:
                 x = layer(x)
+            if not torch.isfinite(x).all():
+                x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
         return self.out_proj(x)
 
 
